@@ -19,10 +19,11 @@ use linera_base::{
 };
 use linera_chain::types::ConfirmedBlockCertificate;
 use linera_core::{
-    client::{BlanketMessagePolicy, ChainClient, Client, MessagePolicy},
+    client::{BlanketMessagePolicy, ChainClient, ChainClientError, Client, MessagePolicy},
     data_types::ClientOutcome,
-    join_set_ext::{JoinSet, JoinSetExt as _},
-    node::CrossChainMessageDelivery,
+    join_set_ext::JoinSet,
+    node::{CrossChainMessageDelivery, NotificationStream},
+    JoinSetExt,
 };
 use linera_rpc::node_provider::{NodeOptions, NodeProvider};
 use linera_storage::Storage;
@@ -411,6 +412,46 @@ where
         }
     }
 
+    pub async fn process_inbox_without_updating_wallet(
+        chain_client: &ChainClient<NodeProvider, S>,
+        notification_stream: &mut NotificationStream,
+    ) -> Result<Vec<ConfirmedBlockCertificate>, Error> {
+        let mut certificates = Vec::new();
+        // Try processing the inbox optimistically without waiting for validator notifications.
+        let (new_certificates, maybe_timeout) = {
+            chain_client.synchronize_from_validators().await?;
+            let result = chain_client.process_inbox_without_prepare().await;
+            result?
+        };
+        certificates.extend(new_certificates);
+        if maybe_timeout.is_none() {
+            return Ok(certificates);
+        }
+
+        loop {
+            let (new_certificates, maybe_timeout) = {
+                let result = chain_client.process_inbox().await;
+                result?
+            };
+            certificates.extend(new_certificates);
+            if let Some(timestamp) = maybe_timeout {
+                util::wait_for_next_round(notification_stream, timestamp).await
+            } else {
+                return Ok(certificates);
+            }
+        }
+    }
+
+    pub async fn start_listening_for_notifications(
+        &mut self,
+        chain_client: &ChainClient<NodeProvider, S>,
+    ) -> Result<NotificationStream, ChainClientError> {
+        // Start listening for notifications, so we learn about new rounds and blocks.
+        let (listener, _listen_handle, notification_stream) = chain_client.listen().await?;
+        self.chain_listeners.spawn_task(listener);
+        Ok(notification_stream)
+    }
+
     /// Applies the given function to the chain client.
     ///
     /// Updates the wallet regardless of the outcome. As long as the function returns a round
@@ -584,14 +625,44 @@ where
     W: Persist<Target = Wallet>,
 {
     pub async fn process_inboxes_and_force_validator_updates(&mut self) {
-        for chain_id in self.wallet.owned_chain_ids() {
-            let chain_client = self
-                .make_chain_client(chain_id)
-                .expect("chains in the wallet must exist");
-            self.process_inbox(&chain_client).await.unwrap();
-            chain_client.update_validators(None).await.unwrap();
+        let chain_clients = self
+            .wallet
+            .owned_chain_ids()
+            .iter()
+            .map(|chain_id| {
+                self.make_chain_client(*chain_id)
+                    .expect("chains in the wallet must exist")
+            })
+            .collect::<Vec<_>>();
+
+        let mut chain_client_and_notification_stream = Vec::new();
+        for chain_client in chain_clients {
+            let notification_stream = self
+                .start_listening_for_notifications(&chain_client)
+                .await
+                .unwrap();
+            chain_client_and_notification_stream.push((chain_client, notification_stream));
+        }
+
+        let mut join_set = task::JoinSet::new();
+        for (chain_client, mut notification_stream) in chain_client_and_notification_stream {
+            join_set.spawn(async move {
+                Self::process_inbox_without_updating_wallet(
+                    &chain_client,
+                    &mut notification_stream,
+                )
+                .await
+                .unwrap();
+                chain_client.update_validators(None).await.unwrap();
+                chain_client
+            });
+        }
+
+        let chain_clients = join_set.join_all().await;
+        for chain_client in chain_clients {
             self.update_wallet_from_client(&chain_client).await.unwrap();
         }
+        self.save_wallet().await.unwrap();
     }
 
     /// Creates chains if necessary, and returns a map of exactly `num_chains` chain IDs
