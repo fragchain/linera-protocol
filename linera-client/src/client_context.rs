@@ -959,7 +959,11 @@ where
         fungible_application_id: Option<ApplicationId>,
     ) -> Vec<RpcMessage> {
         let mut proposals = Vec::new();
-        let mut next_recipient = self.wallet.last_chain().unwrap().chain_id;
+        let mut next_recipient = *key_pairs
+            .iter()
+            .last()
+            .expect("There should be a last element")
+            .0;
         let amount = Amount::from(1);
         for (&chain_id, key_pair) in key_pairs {
             let public_key = key_pair.public();
